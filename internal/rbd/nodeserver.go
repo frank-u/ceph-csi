@@ -1259,6 +1259,25 @@ func (ns *NodeServer) NodeUnpublishVolume(
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
 
+		if util.IsCorruptedMountError(err) {
+			// the mount exists but is corrupted (for example EIO from a
+			// wedged filesystem); unmount it instead of reporting NotFound
+			// and retrying the same failing check forever.
+			log.WarningLog(ctx, "corrupted mount detected in %q, attempting unmount: %v", targetPath, err)
+
+			if unmountErr := ns.Mounter.Unmount(targetPath); unmountErr != nil {
+				return nil, status.Error(codes.Internal, unmountErr.Error())
+			}
+
+			if rmErr := os.Remove(targetPath); rmErr != nil {
+				return nil, status.Error(codes.Internal, rmErr.Error())
+			}
+
+			log.DebugLog(ctx, "rbd: successfully unbound corrupted mount %s from %s", req.GetVolumeId(), targetPath)
+
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
+
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
 	if !isMnt {

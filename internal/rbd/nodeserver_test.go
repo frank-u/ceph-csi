@@ -19,13 +19,19 @@ package rbd
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	mount "k8s.io/mount-utils"
 
 	cephcsi "github.com/ceph/ceph-csi/api/deploy/kubernetes"
 	csicommon "github.com/ceph/ceph-csi/internal/csi-common"
+	hc "github.com/ceph/ceph-csi/internal/health-checker"
 	"github.com/ceph/ceph-csi/internal/util"
 )
 
@@ -309,4 +315,64 @@ func TestReadAffinity_GetReadAffinityMapOptions(t *testing.T) {
 			require.Equal(t, tt.want, readAffinityMapOptions)
 		})
 	}
+}
+
+func TestNodeUnpublishVolume_corruptedMount(t *testing.T) {
+	t.Parallel()
+
+	newNodeServer := func(mounter mount.Interface) *NodeServer {
+		ns := &NodeServer{
+			DefaultNodeServer: &csicommon.DefaultNodeServer{
+				Mounter: mounter,
+			},
+			VolumeLocks: util.NewIDLocker(),
+		}
+		ns.SetHealthChecker(hc.NewHealthCheckManager())
+
+		return ns
+	}
+
+	t.Run("corrupted mount is unmounted instead of reported NotFound", func(t *testing.T) {
+		t.Parallel()
+
+		targetPath := filepath.Join(t.TempDir(), "mount")
+		require.NoError(t, os.WriteFile(targetPath, nil, 0o600))
+
+		fakeMounter := &mount.FakeMounter{
+			MountCheckErrors: map[string]error{
+				targetPath: &os.PathError{Op: "lstat", Path: targetPath, Err: syscall.EIO},
+			},
+		}
+		ns := newNodeServer(fakeMounter)
+
+		resp, err := ns.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
+			VolumeId:   "758978be-6331-4925-b25e-e490fe99c9eb",
+			TargetPath: targetPath,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+
+		_, statErr := os.Stat(targetPath)
+		require.True(t, os.IsNotExist(statErr), "targetPath should have been removed")
+	})
+
+	t.Run("non-corrupted error is still reported NotFound", func(t *testing.T) {
+		t.Parallel()
+
+		targetPath := filepath.Join(t.TempDir(), "mount")
+
+		fakeMounter := &mount.FakeMounter{
+			MountCheckErrors: map[string]error{
+				targetPath: &os.PathError{Op: "lstat", Path: targetPath, Err: syscall.EINVAL},
+			},
+		}
+		ns := newNodeServer(fakeMounter)
+
+		_, err := ns.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
+			VolumeId:   "622cfdeb-69bf-4de6-9bd7-5fa0b71a603e",
+			TargetPath: targetPath,
+		})
+		require.Error(t, err)
+		require.Equal(t, codes.NotFound, status.Code(err))
+	})
 }
